@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SOCKET = "/run/robotd.sock"
 DEG = 180.0 / math.pi
 K = 360.0 / 4096.0
-VERSION = "2026-10-18f"
+VERSION = "2026-10-20-v2"
 
 NAMES = [
     "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
@@ -52,6 +52,32 @@ IDS = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14]
 # servos. With a window here the page can say "this joint is outside its travel" instead of
 # inferring it from a current threshold.
 CAL = {"windows": {}, "zeros": [2048] * 15, "dirs": [1.0] * 15}
+MODEL = {"bytes": None, "path": None}
+
+
+def load_model(path: str) -> None:
+    """Load robotctl's baked render mesh once for the browser's 3D direction view."""
+    candidates = [
+        path,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "duck.bin"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "microduck_ft1910", "robotctl", "assets", "duck.bin"),
+    ]
+    for candidate in candidates:
+        try:
+            with open(candidate, "rb") as fh:
+                blob = fh.read()
+        except OSError:
+            continue
+        if not blob.startswith(b"DUCK"):
+            print(f"note: {candidate} is not a duck.bin")
+            continue
+        MODEL["bytes"] = blob
+        MODEL["path"] = os.path.abspath(candidate)
+        print(f"3D model: {MODEL['path']} ({len(blob)} bytes)")
+        return
+    print("note: no duck.bin found; the 3D direction view will stay empty.")
+    print("      copy robotctl/assets/duck.bin beside duck_dash.py.")
 
 
 def load_calibration(scs_path: str, limits_path: str) -> None:
@@ -373,6 +399,9 @@ def summarise(feed: Feed):
         "min_v": HEALTH.get("min_v"),
         "record": getattr(feed.record, "name", None),
         "recorded": feed.written,
+        "joints": last.get("joints") or [],
+        "targets": last.get("targets") or [],
+        "gravity": gravity,
     }
 
 
@@ -478,6 +507,33 @@ PAGE = """<!doctype html>
   tr.warn td { color: #ffd479; }
   .v { text-align: left; color: #9fb0c4; }
   canvas { vertical-align: middle; }
+  #dirbox { display:grid; grid-template-columns:minmax(0, 1.5fr) minmax(300px, .75fr);
+            align-items:start; gap:18px; margin:16px 0; padding:12px;
+            border:1px solid #26303f; border-radius:8px; background:#0d1117; }
+  #dirbox h2 { font-size:13px; margin:0 0 7px; color:#e6edf6; }
+  #dirbox p { margin:5px 0; color:#8f9eb2; }
+  #dirbox .big { font-size:18px; color:#c9f5d8; font-weight:600; }
+  #jointpick { display:flex; flex-wrap:wrap; gap:5px; margin:8px 0; }
+  #jointpick button { padding:4px 7px; font-size:11px; }
+  #jointpick button.on { border-color:#d58a35; background:#33220f; color:#ffc36b; }
+  #views { display:grid; grid-template-columns:1fr 1fr; align-items:start; gap:8px; }
+  #views canvas { display:block; width:100%; height:auto; aspect-ratio:560 / 640;
+                  background:#11151c; border-radius:6px; border:1px solid #1f2836;
+                  touch-action:none; }
+  #home3d { display:block; width:100%; height:auto; aspect-ratio:440 / 500;
+            background:#11151c; border-radius:6px; border:1px solid #1f2836;
+            margin:8px auto 0; }
+  #dirread { font-size:12px; color:#9fb0c4; line-height:1.8; }
+  #dirread b { color:#e6edf6; }
+  .legend { color:#8f9eb2; font-size:11px; }
+  @media (max-width: 1000px) {
+    #dirbox { grid-template-columns:1fr; }
+    #home3d { max-width:440px; }
+  }
+  @media (max-width: 620px) {
+    body { padding:10px; }
+    #views { grid-template-columns:1fr; }
+  }
 </style>
 <h1>duck servo check <span style="color:#5d6b7d;font-weight:400">__VERSION__</span></h1>
 <div class="bar" id="bar">connecting…</div>
@@ -496,6 +552,29 @@ PAGE = """<!doctype html>
   <a href="/api/file" download style="margin-left:14px;color:#8fb4d8">下载全部记录</a>
 </div>
 <div id="msg"></div>
+<section id="dirbox">
+  <div>
+    <h2>3D joint direction check</h2>
+    <p>Support the duck, then press <b>relax</b>. Choose one joint and move that joint by hand.
+       Left is the live measured pose; right is the same pose with that joint at <b>+15°</b>.
+       The orange arrow is the model's positive direction.</p>
+    <div id="jointpick"></div>
+    <div id="views">
+      <canvas id="live3d" width="560" height="640"></canvas>
+      <canvas id="preview3d" width="560" height="640"></canvas>
+    </div>
+    <div class="legend">Drag either view to orbit. Root is locked upright here; use
+       <b>robotctl monitor</b> when you want the IMU to tilt the whole body.</div>
+  </div>
+  <div>
+    <h2>home reference / home 参考</h2>
+    <canvas id="home3d" width="440" height="500"></canvas>
+    <h2 id="dirname" style="margin-top:12px">select a joint</h2>
+    <div id="dirread">Waiting for robot state.</div>
+    <p><button id="rebase">retake baseline / 重新取基准</button></p>
+    <p class="big" id="dirhint">+ direction unknown</p>
+  </div>
+</section>
 <table>
   <thead><tr>
     <th>joint</th><th>id</th><th>cmd°</th><th>meas°</th><th>err°</th>
@@ -535,6 +614,248 @@ const PANELS = SHOWN.map((index) => {
 });
 const PANEL_OF = {};
 PANELS.forEach((panel) => { PANEL_OF[panel.index] = panel; });
+
+// robotctl's baked sim mesh. The same geometry the trained policy sees, parsed here so the
+// browser can answer a question the numbers cannot: which way should this joint move?
+let DUCK = null;
+let liveJoints = null;
+let liveGravity = [0, 0, 0];
+let selectedJoint = 1;
+let viewYaw = -1.45, viewPitch = 0.22;
+let dirBaseline = 0;
+const HOME_DEG = [0,-5,-26.24,-0.28,25.96,20,20,0,0,0,0,5,26.24,0.28,-25.96];
+const HOME_RAD = HOME_DEG.map((value)=>value*Math.PI/180);
+// Joint-direction checking cares about the measured joint angles, not the trunk attitude.
+// Locking the root upright prevents an IMU mount/sign mismatch from turning the whole model over.
+const MODEL_UP = [0,0,-1];
+
+function parseDuck(buffer) {
+  const d = new DataView(buffer);
+  let at = 0;
+  const take = (n) => {
+    if (at + n > d.byteLength) throw new Error('duck.bin truncated');
+    const out = new Uint8Array(buffer, at, n); at += n; return out;
+  };
+  const u16 = () => { const v = d.getUint16(at, true); at += 2; return v; };
+  const i16 = () => { const v = d.getInt16(at, true); at += 2; return v; };
+  const u32 = () => { const v = d.getUint32(at, true); at += 4; return v; };
+  const f32 = () => { const v = d.getFloat32(at, true); at += 4; return v; };
+  const vec = () => [f32(), f32(), f32()];
+  const quat = () => [f32(), f32(), f32(), f32()];
+  const magic = Array.from(take(4)).map((x) => String.fromCharCode(x)).join('');
+  if (magic !== 'DUCK' || u32() !== 1) throw new Error('duck.bin format mismatch');
+  const nm = u16(), nb = u16(), np = u16(), meshes = [], bodies = [], parts = [];
+  for (let i = 0; i < nm; i++) {
+    const nv = u16(), nt = u16(), verts = [];
+    for (let v = 0; v < nv; v++) verts.push(vec());
+    const tris = [];
+    for (let t = 0; t < nt; t++) tris.push([u16(), u16(), u16()]);
+    meshes.push({verts, tris});
+  }
+  for (let i = 0; i < nb; i++)
+    bodies.push({parent: i16(), joint: i16(), pos: vec(), quat: quat(), axis: vec()});
+  for (let i = 0; i < np; i++) {
+    const body = u16(), mesh = u16(), rgb = Array.from(take(4));
+    parts.push({body, mesh, rgb, pos: vec(), quat: quat()});
+  }
+  return {meshes, bodies, parts};
+}
+
+const ident = () => ({r: [[1,0,0],[0,1,0],[0,0,1]], t: [0,0,0]});
+function qpose(q, t) {
+  const n = Math.hypot(...q) || 1, w=q[0]/n, x=q[1]/n, y=q[2]/n, z=q[3]/n;
+  return {r: [
+    [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+    [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
+    [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]], t};
+}
+function apose(axis, angle) {
+  const n = Math.hypot(...axis) || 1, x=axis[0]/n, y=axis[1]/n, z=axis[2]/n;
+  const c=Math.cos(angle), s=Math.sin(angle), i=1-c;
+  return {r: [
+    [c+x*x*i, x*y*i-z*s, x*z*i+y*s],
+    [y*x*i+z*s, c+y*y*i, y*z*i-x*s],
+    [z*x*i-y*s, z*y*i+x*s, c+z*z*i]], t:[0,0,0]};
+}
+function mvec(m, v) {
+  return [m[0][0]*v[0]+m[0][1]*v[1]+m[0][2]*v[2],
+          m[1][0]*v[0]+m[1][1]*v[1]+m[1][2]*v[2],
+          m[2][0]*v[0]+m[2][1]*v[1]+m[2][2]*v[2]];
+}
+function mmul(a, b) {
+  const r = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++)
+    r[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
+  return r;
+}
+function then(a, b) {
+  const t = mvec(a.r, b.t);
+  return {r: mmul(a.r,b.r), t:[t[0]+a.t[0],t[1]+a.t[1],t[2]+a.t[2]]};
+}
+function apply(p,v) {
+  const q=mvec(p.r,v); return [q[0]+p.t[0],q[1]+p.t[1],q[2]+p.t[2]];
+}
+function cross(a,b) { return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]; }
+function normv(a) { const n=Math.hypot(...a)||1; return [a[0]/n,a[1]/n,a[2]/n]; }
+function attitude(g) {
+  const v=normv(g), down=[0,0,-1], axis=cross(v,down), s=Math.hypot(...axis), c=v[2];
+  if (s < 1e-6) return c > 0 ? ident() : apose([1,0,0],Math.PI);
+  return apose([axis[0]/s,axis[1]/s,axis[2]/s],Math.atan2(s,c));
+}
+function fk(angles, gravity) {
+  const poses=[];
+  for (const body of DUCK.bodies) {
+    let pose = body.parent < 0 ? attitude(gravity) : poses[body.parent];
+    pose = then(pose, qpose(body.quat, body.pos));
+    if (body.joint >= 0) pose = then(pose, apose(body.axis, angles[body.joint] || 0));
+    poses.push(pose);
+  }
+  return poses;
+}
+function descendant(bodyIndex, poses, origin) {
+  let best=null, bestLength=-1;
+  for (let i=0;i<DUCK.bodies.length;i++) {
+    let p=DUCK.bodies[i].parent;
+    while (p >= 0) {
+      if (p === bodyIndex) {
+        const q=poses[i].t, length=Math.hypot(q[0]-origin[0],q[1]-origin[1],q[2]-origin[2]);
+        if (length > bestLength) { best=poses[i]; bestLength=length; }
+        break;
+      }
+      p = DUCK.bodies[p].parent;
+    }
+  }
+  return best;
+}
+function arrowFor(jointIndex, poses) {
+  if (jointIndex < 0) return null;
+  const bi = DUCK.bodies.findIndex((b) => b.joint === jointIndex);
+  if (bi < 0) return null;
+  const origin = poses[bi].t;
+  const axis = normv(mvec(poses[bi].r, DUCK.bodies[bi].axis));
+  const child = descendant(bi, poses, origin);
+  if (!child) return {points:[origin,[origin[0]+axis[0]*0.026,
+                                      origin[1]+axis[1]*0.026,
+                                      origin[2]+axis[2]*0.026]], kind:'axis'};
+  const radius = [child.t[0]-origin[0], child.t[1]-origin[1], child.t[2]-origin[2]];
+  const tangent = cross(axis, radius), length = Math.hypot(...tangent);
+  if (length < 1e-5) return {points:[origin,[origin[0]+axis[0]*0.026,
+                                         origin[1]+axis[1]*0.026,
+                                         origin[2]+axis[2]*0.026]], kind:'axis'};
+  return {points:[origin, [origin[0]+tangent[0]/length*0.026,
+                           origin[1]+tangent[1]/length*0.026,
+                           origin[2]+tangent[2]/length*0.026]], kind:'move'};
+}
+function project(vertices, w, h, yaw = viewYaw, pitch = viewPitch) {
+  let floor=Infinity;
+  for (const v of vertices) floor=Math.min(floor,v[2]);
+  const look=[0,0,0.13], ce=Math.cos(pitch), se=Math.sin(pitch);
+  const ca=Math.cos(yaw), sa=Math.sin(yaw);
+  const fwd=[-ce*ca,-ce*sa,-se], right=normv(cross(fwd,[0,0,1]));
+  const up=cross(right,fwd), window=0.36, scale=Math.min(w,h)/window;
+  return (v) => {
+    const p=[v[0],v[1],v[2]-floor];
+    return [w/2 + (p[0]*right[0]+p[1]*right[1]+p[2]*right[2])*scale,
+            h/2 + ((p[0]*up[0]+p[1]*up[1]+p[2]*up[2]) -
+                   (look[0]*up[0]+look[1]*up[1]+look[2]*up[2]))*scale,
+            p[0]*fwd[0]+p[1]*fwd[1]+p[2]*fwd[2]];
+  };
+}
+function drawDuck(canvas, angles, gravity, selected, ghost, label, cameraYaw, cameraPitch) {
+  if (!DUCK) return;
+  const ctx=canvas.getContext('2d'), w=canvas.width, h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='#11151c'; ctx.fillRect(0,0,w,h);
+  const poses=fk(angles,gravity), vertices=[], triangles=[];
+  const selectedBody=selected >= 0 ? DUCK.bodies.findIndex((body)=>body.joint===selected) : -1;
+  const light=normv([0.35,0.45,-0.82]);
+  for (const part of DUCK.parts) {
+    const pose=then(poses[part.body],qpose(part.quat,part.pos));
+    const mesh=DUCK.meshes[part.mesh];
+    const start=vertices.length;
+    for (const v of mesh.verts) vertices.push(apply(pose,v));
+    for (const tri of mesh.tris) {
+      const a=vertices[start+tri[0]], b=vertices[start+tri[1]], c=vertices[start+tri[2]];
+      const n=normv(cross([b[0]-a[0],b[1]-a[1],b[2]-a[2]],
+                          [c[0]-a[0],c[1]-a[1],c[2]-a[2]]));
+      const shade=0.32+0.68*Math.abs(n[0]*light[0]+n[1]*light[1]+n[2]*light[2]);
+      const rgb=ghost ? [244,144,48] : (part.body===selectedBody ? [62,190,220] : part.rgb);
+      triangles.push({a,b,c,depth:(a[0]+b[0]+c[0]+a[1]+b[1]+c[1]+a[2]+b[2]+c[2])/3,
+        colour:`rgb(${rgb[0]*shade|0},${rgb[1]*shade|0},${rgb[2]*shade|0})`});
+    }
+  }
+  const arrow=arrowFor(selected,poses);
+  if (arrow) vertices.push(...arrow.points);
+  const P=project(vertices,w,h,cameraYaw,cameraPitch);
+  triangles.sort((a,b)=>b.depth-a.depth);
+  for (const t of triangles) {
+    const a=P(t.a), b=P(t.b), c=P(t.c);
+    ctx.fillStyle=t.colour; ctx.beginPath(); ctx.moveTo(a[0],a[1]);
+    ctx.lineTo(b[0],b[1]); ctx.lineTo(c[0],c[1]); ctx.closePath(); ctx.fill();
+  }
+  if (arrow) {
+    const a=P(arrow.points[0]), b=P(arrow.points[1]);
+    const dx=b[0]-a[0], dy=b[1]-a[1], len=Math.hypot(dx,dy)||1;
+    const ux=dx/len, uy=dy/len;
+    ctx.strokeStyle='#ffad3d'; ctx.fillStyle='#ffad3d'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(b[0],b[1]);
+    ctx.lineTo(b[0]-ux*13-uy*6,b[1]-uy*13+ux*6);
+    ctx.lineTo(b[0]-ux*13+uy*6,b[1]-uy*13-ux*6); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#ffc36b'; ctx.font='14px ui-monospace';
+    ctx.fillText(arrow.kind==='axis'?'twist axis':'+ direction',b[0]+7,b[1]-7);
+  }
+  ctx.fillStyle=ghost?'#ffb15c':'#8fd68f'; ctx.font='13px ui-monospace';
+  ctx.fillText(label || (ghost?'expected: +15 deg':'live measured'),14,22);
+}
+function render3d() {
+  if (!DUCK || !liveJoints || liveJoints.length !== 15) return;
+  const preview=liveJoints.slice(); preview[selectedJoint] += 15*Math.PI/180;
+  drawDuck($('live3d'),liveJoints,MODEL_UP,selectedJoint,false);
+  drawDuck($('preview3d'),preview,MODEL_UP,selectedJoint,true);
+  drawDuck($('home3d'),HOME_RAD,MODEL_UP,-1,false,'home reference (upright)',-0.7,0.32);
+  const deg=liveJoints[selectedJoint]*180/Math.PI, delta=deg-dirBaseline;
+  $('dirread').innerHTML =
+    'selected <b>'+NAMES[selectedJoint]+'</b> · id <b>'+[20,21,22,23,24,30,31,32,33,34,10,11,12,13,14][selectedJoint]+'</b><br>'+
+    'measured <b>'+deg.toFixed(1)+'°</b> · since baseline <b>'+(delta>=0?'+':'')+delta.toFixed(1)+'°</b>';
+  $('dirhint').textContent = Math.abs(delta)<0.5 ? '+ direction: move it by hand' :
+    (delta>0 ? 'you moved toward the orange arrow (+ model direction)' :
+               'you moved opposite the orange arrow (- model direction)');
+}
+
+const JOINT_PICK=$('jointpick');
+$('rebase').onclick=()=>{
+  dirBaseline=liveJoints?liveJoints[selectedJoint]*180/Math.PI:0; render3d();
+};
+NAMES.forEach((name,index)=>{
+  const b=document.createElement('button'); b.textContent=name.replace('_hip',' hip').replace('_',' ');
+  b.onclick=()=>{
+    selectedJoint=index; dirBaseline=liveJoints?liveJoints[index]*180/Math.PI:0;
+    for (const x of JOINT_PICK.children) x.classList.toggle('on',Number(x.dataset.i)===index);
+    $('dirname').textContent=name; render3d();
+  };
+  b.dataset.i=String(index); if(index===selectedJoint)b.classList.add('on'); JOINT_PICK.append(b);
+});
+$('dirname').textContent=NAMES[selectedJoint];
+
+for (const canvas of [$('live3d'),$('preview3d')]) {
+  let drag=null;
+  canvas.addEventListener('pointerdown',(e)=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId);});
+  canvas.addEventListener('pointermove',(e)=>{
+    if(!drag)return; viewYaw += (e.clientX-drag[0])*0.012;
+    viewPitch = Math.max(-0.1,Math.min(1.15,viewPitch+(e.clientY-drag[1])*0.008));
+    drag=[e.clientX,e.clientY]; render3d();
+  });
+  for(const n of ['pointerup','pointercancel']) canvas.addEventListener(n,()=>{drag=null;});
+}
+
+fetch('/api/model').then((r)=>r.ok?r.arrayBuffer():Promise.reject(new Error('duck.bin missing')))
+  .then((buf)=>{
+    DUCK=parseDuck(buf);
+    drawDuck($('home3d'),HOME_RAD,MODEL_UP,-1,false,'home reference (upright)',-0.7,0.32);
+    render3d();
+  })
+  .catch((e)=>{$('dirhint').textContent='3D unavailable: '+e.message;});
 
 function drawPanel(panel, item) {
   const ctx = panel.ctx, w = panel.canvas.width, h = panel.canvas.height;
@@ -736,6 +1057,13 @@ async function tick() {
     '</tr>';
   }).join('');
 
+  if (Array.isArray(data.joints) && data.joints.length === 15) {
+    if (!liveJoints) dirBaseline = data.joints[selectedJoint] * 180 / Math.PI;
+    liveJoints = data.joints;
+    liveGravity = data.gravity || [0, 0, 0];
+    if (tickCount % 2 === 0) render3d();
+  }
+
   tickCount += 1;
   if (tickCount % 2 === 0) {
     try {
@@ -798,6 +1126,11 @@ class Handler(BaseHTTPRequestHandler):
                 frames = list(self.feed.frames)
             self.send(200, "\n".join(json.dumps(frame) for frame in frames),
                       "application/x-ndjson")
+        elif self.path == "/api/model":
+            if MODEL["bytes"] is None:
+                self.send(404, json.dumps({"error": "duck.bin is missing"}))
+            else:
+                self.send(200, MODEL["bytes"], "application/octet-stream")
         else:
             self.send(404, json.dumps({"error": "no such path"}))
 
@@ -874,6 +1207,8 @@ def main() -> int:
                     help="the calibration the daemon is using")
     ap.add_argument("--limits", default="/etc/robot/limits.json",
                     help="windows read out of the servos with set_limits.py --save")
+    ap.add_argument("--model", default="duck.bin",
+                    help="robotctl/assets/duck.bin for the 3D direction view")
     args = ap.parse_args()
 
     if not os.path.exists(SOCKET):
@@ -881,6 +1216,7 @@ def main() -> int:
         return 1
 
     load_calibration(args.scs, args.limits)
+    load_model(args.model)
     path = args.record or f"duck-run-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     record = open(path, "a", encoding="utf-8")
     feed = Feed(args.hz, args.seconds, record)
