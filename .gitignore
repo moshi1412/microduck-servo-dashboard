@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+duck-run-*.jsonl
+duck-state.jsonl
+*.png
+.DS_Store
