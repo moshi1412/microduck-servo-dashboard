@@ -1,134 +1,134 @@
 # microduck-servo-dashboard
 
-## v2.0.0
+用于 Radxa Zero 3W + URT-2 + Feetech HD-1910 的 MicroDuck 调试仪表盘。它订阅
+`robotd` 的 `robot.state`，实时显示 15 个关节的指令、实测、误差、相位滞后、
+振荡和电流，并提供姿态、策略和动作控制。
 
-- 新增训练模型的 3D 关节方向检查。
-- 新增固定正立的 home 姿态参考图。
-- 3D 画布保持原始宽高比，模型不再被横向压扁。
-- 窄屏自动改为单列布局。
+## v3.0.0
 
-## 3D 方向确认（2026-10-20）
+- 实时舵机曲线、关节表、记录和 CSV/JSONL 下载。
+- `init`、`enable`、暂停、卸力和速度控制。
+- 训练模型的正立 3D 姿态、关节方向检查、`+15°` 预览和 home 参考图。
+- 策略慢放：50/25/10/5/2 Hz。
+- 手工单步推理：一次点击只运行一帧 ONNX。
+- 动作按钮：坐下/起立、捡取、左踢、前滚翻。
+- 自动处理 root 权限，原子更新 `robotd.toml`，并热重载策略。
 
-页面会读取 `robot.state` 里的 15 个实测关节角，用训练时的同一份 `duck.bin`
-渲染鸭子。左侧是实机当前姿态，右侧是所选关节 `+15°` 的期望姿态；橙色箭头是
-模型正方向，蓝色部件是所选关节。右侧另有固定正立的 home 参考图，不受 IMU
-安装方向影响。三个 3D 视图都锁定了躯干竖直，只用于检查关节；要看 IMU 倾斜，
-继续使用 `robotctl monitor`。
+## 依赖
 
-安全用法：
+- Python 3.9+，Dashboard 本身只用标准库。
+- 正在运行的 `robotd`，默认 socket 为 `/run/robotd.sock`。
+- 3D 页面需要同目录下的 `duck.bin`。
+- 慢放和单步需要带 `policy_step_divisor` 支持的 companion `robotd`。
+
+慢放使用的 `robotd` 二进制放在工作区的 `slowmo-v2` 交付目录中。官方原版
+`robotd` 不认识这个配置项。
+
+## 启动
+
+把 `duck_dash.py` 和 `duck.bin` 放在板子的同一目录：
 
 ```bash
-# 板子上，先把 duck_dash.py 和 duck.bin 放进同一个目录
 cd ~/microduck-servo-dashboard
 sudo python3 duck_dash.py
 ```
 
-电脑端建立 SSH 转发：
+如果忘记 `sudo`，程序会在打开网页端口前自动通过 `sudo` 重启自身。没有交互式终端
+时请直接使用 `sudo`。
+
+从 Windows 建立 SSH 转发：
 
 ```powershell
-ssh -L 8770:127.0.0.1:8770 radxa@<板子IP>
+ssh -N -L 8770:127.0.0.1:8770 radxa@<板子IP>
 ```
 
-浏览器打开 `http://127.0.0.1:8770`。扶住鸭子，按页面上的 `relax`，选择一个关节，
-只用手转动这一颗；左侧蓝线姿态若跟右侧橙色预览同向，说明 ID、关节映射和
-`direction` 同号。若反向，就是这个关节的 `direction` 需要翻转。不要让策略
-`enable` 来做这项检查。
+浏览器打开：
 
-一块跑在机器人的板子上的网页仪表盘，用来回答一个问题：**是舵机的问题，还是策略/指令的问题。**
+```text
+http://127.0.0.1:8770
+```
 
-它订阅 `robotd` 的 `robot.state`（50 Hz），实时显示 15 个关节的指令、实测、跟踪误差、相位滞后、振荡频率、电流，以及指令是否超出了这颗舵机自己 EEPROM 里的行程窗口；页面上的按钮可以直接 `init`、`enable`、暂停和断力矩。
+## 策略慢放
 
-在 Radxa Zero 3W + URT-2 + 飞特 HD-1910M 的 MicroDuck 上开发和验证，但只要 `robotd` 在跑、`/run/robotd.sock` 在，任何后端都能用。
+页面顶部可选择：
 
-## 依赖
+| 显示 | 策略推理频率 | 说明 |
+| --- | ---: | --- |
+| 1× | 50 Hz | 正常训练节奏 |
+| 2× | 25 Hz | 每两拍推理一次 |
+| 5× | 10 Hz | 每五拍推理一次 |
+| 10× | 5 Hz | 每十拍推理一次 |
+| 25× | 2 Hz | 逐段观察 |
+| single-step | 手动 | 点击一次按钮只推理一帧 |
 
-- 运行仪表盘：Python 3.9+，**只用标准库**（`socket` / `http.server` / `json`）
-- 离线出图 `plot_state.py`：`matplotlib`
-- 读舵机限位 `set_limits.py`：`pyserial`
+控制环仍以正常运行频率写舵机；未推理的拍保持上一组完整目标。慢放只作用于
+`walk`/`stand`，技能和起坐保持训练时长。
 
-## 快速开始
+应用档位会先卸力，原子更新 `/etc/robot/robotd.toml`，再调用
+`robot.reloadPolicies`。应用后重新执行：
+
+```text
+init -> enable
+```
+
+慢放用于观察和定位，不能用于评价策略原本是否正常。调试结束应切回 `1×`。
+
+## 单步推理
+
+1. 选择 `single-step · manual` 并应用。
+2. 执行 `init`。
+3. 执行 `enable`；此时只保持当前位置。
+4. 点击“单步推理”运行第一帧。
+5. 每再点击一次，就用最新传感器状态和上一帧动作运行一帧。
+
+## 动作按钮
+
+动作按钮需要先 `init` 和 `enable`。它们和下面命令等价：
 
 ```bash
-# 电脑上
-scp duck_dash.py radxa@<板子IP>:~
-
-# 板子上
-cd ~ && sudo python3 duck_dash.py
-
-# 电脑上另开一个终端做端口转发
-ssh -L 8770:127.0.0.1:8770 radxa@<板子IP>
-# 浏览器打开 http://127.0.0.1:8770
+robotctl robot do sit_toggle
+robotctl robot do ground_pick
+robotctl robot do kick_left
+robotctl robot do roulade
 ```
 
-标题右边有版本号，用来确认板上跑的是哪一版。
+当前 HD-1910 模型包没有 `kick_right`，因此页面不放右踢按钮。这些定时动作不受
+慢放影响。
 
-## 页面
+## 3D 方向检查
 
-**按钮**
+扶住鸭子后按 `relax`，选择一个关节，再用手只转动该关节：
 
-| 按钮 | 发的命令 | 效果 |
-| --- | --- | --- |
-| init | `robot.init` | 通电并斜坡到 home 姿态 |
-| enable | `robot.enable {on:true}` | 把机器人交给策略 |
-| 暂停（空格） | `robot.enable {on:false}` | 策略停手，关节**仍带电**保持姿势 |
-| 停止 / 脱力（Esc） | `robot.relax` | 断掉全部力矩，电流归零 |
-| 按住前进 | 持续 `robot.move {vx}` | 松开发 0 并停；deadman 500 ms |
-| 自动暂停 | 开关 | 误差/电压超阈值时自动停止，默认**关** |
+- 网页中动的应是同一个关节；
+- 左侧实测姿态应跟随右侧 `+15°` 预览；
+- 反向说明该关节 `direction` 需要翻转。
 
-**14 格曲线**（嘴不参与步态，不画）
+3D 视图固定躯干竖直，只用于检查关节；IMU 倾斜请使用 `robotctl monitor`。
 
-蓝 = 指令（策略请求的角度，**裁剪之前**），绿 = 实测，红虚线 = 这颗舵机自己的行程窗口。每格纵轴各自缩放，左上/左下是该格的最大/最小值，标题右侧是 `max|e|`。
+## 权限与排错
 
-**表格**
-
-`cmd / meas / err` 是最后一帧；`mean|err| / max` 是窗口内的统计；`lag` 是指令与实测的互相关延迟，`r` 是那个相关的可信度（低于 0.3 说明这段里关节没怎么动，`lag` 别看）；`osc/s` 是实测速度每秒换向次数；`限位` 是"指令落在窗口外的帧比例 / 最多超出多少度"。
-
-判定列是这些数字的粗分类：`跟得住`、`撞窗口`、`顶着（限位或卡死）`、`在振荡`、`太软/跟不上`、`稳态偏（零点）`。
-
-## 数据
-
-每次启动都会把**每一帧**追加到 `duck-run-<时间>.jsonl`（与 8 秒显示窗口无关，冻结也不影响写入）。页面上两个下载链接分别给出冻结窗口和整份记录。
-
-离线出图：
+配置路径默认是 `/etc/robot/robotd.toml`。检查：
 
 ```bash
-python plot_state.py duck-run-20261018-153012.jsonl -o curves.png
-python plot_state.py duck-run-xxx.jsonl --joints left_hip_roll,head_yaw
+grep -nE '^\[policy\]|^policy_step_divisor' /etc/robot/robotd.toml
+sudo lsattr /etc/robot/robotd.toml
 ```
 
-每行是一帧：
-
-```json
-{"t":337.265,"policy":"walk","joints":[...15 弧度...],"targets":[...15 弧度...],
- "currents_ma":[...15],"safety":{"fallen":true,"limp":false,"gain":200},"loop":{"hz":50.0,"missed":4}}
-```
-
-## 真实行程窗口
-
-曲线上的红虚线和表格里的「限位」列需要一份从舵机读出来的窗口文件。读它要独占串口，所以 `robotd` 得先停：
+如果文件带 `i` 属性：
 
 ```bash
-sudo systemctl stop robotd
-python3 set_limits.py --port /dev/ttyACM0 --save /etc/robot/limits.json
-sudo systemctl restart robotd
+sudo chattr -i /etc/robot/robotd.toml
 ```
 
-没有这份文件时，界面照常工作，只是「限位」列和红虚线为空。
+常见错误：
 
-`set_limits.py` **不带 `--apply` 时是只读的**；带 `--apply` 会写舵机 EEPROM，那是不可中断的操作，用之前请确认窗口数值。
+- `Permission denied`：用 `sudo python3 duck_dash.py` 启动。
+- `switch ... to single-step first`：TOML 当前不是 `policy_step_divisor = 0`。
+- 单步无反应：确认已安装 companion `robotd`，并完成 `init -> enable`。
 
 ## 安全
 
-- 「暂停」不等于「停止」：暂停后关节仍在用力保持姿势，若在较劲电流不会下降。防掉电要按「停止 / 脱力」。
-- 自动停止（`--watch`）默认关闭，并且 enable 之后 3 秒内不会触发——机器人正在起身时最容易误判。
-- 低压会自动停止：`--floor` 默认 6.6 V。
-- 这个程序本身**不写**机器人任何东西，除了你按下的那三个按钮。
-
-## 已知限制
-
-- 没有 3D 模型。`robotctl monitor` 已经有（用 `robotctl/assets/duck.bin`），这里不重复实现。
-- 只订阅本地 unix socket，不做认证；默认监听 `127.0.0.1`，请用 SSH 转发访问，不要直接暴露到网络。
-
-## 版本
-
-`duck_dash.py` 顶部的 `VERSION` 会显示在页面标题旁。每次行为变化都改它，省得对着旧页面判断新逻辑。
+- `relax` 会断电，鸭子会倒。
+- 暂停策略不等于卸力。
+- 前滚翻和踢腿第一次测试时清空空间并扶稳机器人。
+- 仪表盘默认只监听 `127.0.0.1`，通过 SSH 转发访问。

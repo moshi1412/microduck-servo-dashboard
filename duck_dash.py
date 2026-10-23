@@ -30,7 +30,10 @@ import collections
 import json
 import math
 import os
+import re
 import socket
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -39,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SOCKET = "/run/robotd.sock"
 DEG = 180.0 / math.pi
 K = 360.0 / 4096.0
-VERSION = "2026-10-20-v2"
+VERSION = "2026-10-22-slowmo2-actions"
 
 NAMES = [
     "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
@@ -53,6 +56,95 @@ IDS = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14]
 # inferring it from a current threshold.
 CAL = {"windows": {}, "zeros": [2048] * 15, "dirs": [1.0] * 15}
 MODEL = {"bytes": None, "path": None}
+SLOW = {"divisor": 1, "config": None, "error": None}
+
+
+def read_policy_divisor(path: str) -> int:
+    """Read the dashboard's own slow-motion key without reserializing the TOML."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            section = None
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    section = stripped[1:-1]
+                elif section == "policy":
+                    match = re.match(r"policy_step_divisor\s*=\s*(\d+)", stripped)
+                    if match:
+                        return max(0, min(50, int(match.group(1))))
+    except OSError as e:
+        SLOW["error"] = f"{path}: {e}"
+        return 1
+    SLOW["error"] = None
+    return 1
+
+
+def write_policy_divisor(path: str, divisor: int) -> None:
+    """Replace or insert `[policy] policy_step_divisor`, preserving the rest of the file."""
+    divisor = max(0, min(50, divisor))
+    path = os.path.realpath(path)
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.readlines()
+
+    in_policy = False
+    policy_end = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_policy:
+                policy_end = index
+                break
+            in_policy = stripped == "[policy]"
+        elif in_policy and re.match(r"policy_step_divisor\s*=", stripped):
+            lines[index] = f"policy_step_divisor = {divisor}\n"
+            write_lines_atomically(path, lines)
+            return
+
+    if policy_end is None:
+        policy_end = len(lines)
+    insert_at = policy_end
+    if in_policy and policy_end == len(lines):
+        while insert_at > 0 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, f"policy_step_divisor = {divisor}\n")
+    elif in_policy:
+        lines.insert(insert_at, f"policy_step_divisor = {divisor}\n")
+    else:
+        raise ValueError(f"{path} has no [policy] section")
+
+    write_lines_atomically(path, lines)
+
+
+def write_lines_atomically(path: str, lines: list[str]) -> None:
+    """Write beside the target, fsync, and rename so robotd never sees half a config."""
+    mode = os.stat(path).st_mode & 0o777
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(prefix=".robotd.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def ensure_root() -> None:
+    """The dashboard writes a root-owned config and restarts services; elevate before serving."""
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        return
+    if not sys.stdin.isatty():
+        raise PermissionError(
+            "robotd.toml needs root; start with: sudo python3 duck_dash.py"
+        )
+    print("duck_dash needs root for robotd.toml; asking sudo to restart it", flush=True)
+    os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
 
 def load_model(path: str) -> None:
@@ -548,6 +640,22 @@ PAGE = """<!doctype html>
   <input id="vx" type="number" value="0.08" step="0.02" min="-0.3" max="0.3"
          style="width:64px;background:#1b2330;color:#d7dde6;border:1px solid #33415a;border-radius:5px;padding:5px">
   <span style="color:#7f8ea3">m/s</span>
+  <span style="color:#7f8ea3">策略慢放</span>
+  <select id="slowdiv" style="background:#1b2330;color:#d7dde6;border:1px solid #33415a;border-radius:5px;padding:5px">
+    <option value="0">single-step · manual</option>
+    <option value="1">1× · 50 Hz</option>
+    <option value="2">2× · 25 Hz</option>
+    <option value="5">5× · 10 Hz</option>
+    <option value="10">10× · 5 Hz</option>
+    <option value="25">25× · 2 Hz</option>
+  </select>
+  <button data-a="slow">应用慢放</button>
+  <button data-a="step">单步推理</button>
+  <span style="color:#7f8ea3;margin-left:8px">动作</span>
+  <button data-a="sit_toggle">坐下 / 起立</button>
+  <button data-a="ground_pick">捡取</button>
+  <button data-a="kick_left">左踢</button>
+  <button data-a="roulade">前滚翻</button>
   <a href="/api/dump" download="duck-state.jsonl" style="margin-left:14px;color:#8fb4d8">下载冻结数据</a>
   <a href="/api/file" download style="margin-left:14px;color:#8fb4d8">下载全部记录</a>
 </div>
@@ -857,6 +965,16 @@ fetch('/api/model').then((r)=>r.ok?r.arrayBuffer():Promise.reject(new Error('duc
   })
   .catch((e)=>{$('dirhint').textContent='3D unavailable: '+e.message;});
 
+fetch('/api/slow').then((r)=>r.json()).then((value)=>{
+  const divisor=Number(value.divisor)||1, select=$('slowdiv');
+  if (![...select.options].some((option)=>Number(option.value)===divisor)) {
+    const option=document.createElement('option');
+    option.value=String(divisor); option.textContent=divisor+'× · '+(50/divisor).toFixed(1)+' Hz';
+    select.append(option);
+  }
+  select.value=String(divisor);
+}).catch(()=>{});
+
 function drawPanel(panel, item) {
   const ctx = panel.ctx, w = panel.canvas.width, h = panel.canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -939,7 +1057,9 @@ for (const button of document.querySelectorAll('button[data-a]')) {
     $('msg').className = '';
     $('msg').textContent = button.dataset.a + ' …';
     try {
-      const response = await fetch('/api/' + button.dataset.a, {method: 'POST'});
+      let path = '/api/' + button.dataset.a;
+      if (button.dataset.a === 'slow') path += '?divisor=' + encodeURIComponent($('slowdiv').value);
+      const response = await fetch(path, {method: 'POST'});
       const body = await response.json();
       const text = JSON.stringify(body.result ?? body.error ?? body);
       $('msg').textContent = button.dataset.a + ' → ' + text;
@@ -1131,12 +1251,93 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(404, json.dumps({"error": "duck.bin is missing"}))
             else:
                 self.send(200, MODEL["bytes"], "application/octet-stream")
+        elif self.path == "/api/slow":
+            self.send(200, json.dumps({
+                **SLOW,
+                "euid": os.geteuid() if hasattr(os, "geteuid") else None,
+            }))
         else:
             self.send(404, json.dumps({"error": "no such path"}))
 
     def do_POST(self):
         action = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
-        if action == "init":
+        if action == "slow":
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+            try:
+                divisor = int(query.get("divisor", "1"))
+                if not 0 <= divisor <= 50:
+                    raise ValueError
+            except ValueError:
+                self.send(200, json.dumps({"ok": False, "error": "divisor must be 1..50"}))
+                return
+            if not SLOW["config"]:
+                self.send(200, json.dumps({"ok": False, "error": "robotd config path is unknown"}))
+                return
+            try:
+                # The config is read only at startup. Release torque first, persist the choice,
+                # then ask the running daemon to re-read [policy]. The operator explicitly
+                # init/enables again afterward.
+                stop(self.feed, f"applying policy slow motion {divisor}x")
+                write_policy_divisor(SLOW["config"], divisor)
+                SLOW["divisor"] = divisor
+                SLOW["error"] = None
+                reloaded = rpc({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "robot.reloadPolicies",
+                }, timeout=20.0) or {}
+                self.send(200, json.dumps({
+                    "ok": "error" not in reloaded,
+                    "divisor": divisor,
+                    "inference_hz": 50.0 / divisor,
+                    "note": "policies reloaded limp; press init, then enable",
+                    "reload": reloaded,
+                }))
+            except (OSError, ValueError) as e:
+                SLOW["error"] = str(e)
+                self.send(200, json.dumps({
+                    "ok": False,
+                    "error": str(e),
+                    "hint": "run: sudo python3 duck_dash.py",
+                }))
+            return
+        elif action == "step":
+            current = read_policy_divisor(SLOW["config"]) if SLOW["config"] else SLOW["divisor"]
+            SLOW["divisor"] = current
+            if current != 0:
+                self.send(200, json.dumps({
+                    "ok": False,
+                    "error": f"TOML currently says divisor={current}; select single-step and apply it first",
+                }))
+                return
+            try:
+                answer = rpc({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "robot.do",
+                    "params": {"skill": "policy_step"},
+                }) or {}
+                self.send(200, json.dumps({"ok": "error" not in answer, **answer}))
+            except OSError as e:
+                self.send(200, json.dumps({"ok": False, "error": str(e)}))
+            return
+        elif action in ("sit_toggle", "ground_pick", "kick_left", "kick_right", "roulade"):
+            try:
+                answer = rpc({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "robot.do",
+                    "params": {"skill": action},
+                }, timeout=20.0) or {}
+                self.send(200, json.dumps({
+                    "ok": "error" not in answer,
+                    "skill": action,
+                    **answer,
+                }))
+            except OSError as e:
+                self.send(200, json.dumps({"ok": False, "error": str(e)}))
+            return
+        elif action == "init":
             call = {"jsonrpc": "2.0", "id": 1, "method": "robot.init"}
         elif action == "enable":
             WATCH["note"] = ""
@@ -1209,7 +1410,11 @@ def main() -> int:
                     help="windows read out of the servos with set_limits.py --save")
     ap.add_argument("--model", default="duck.bin",
                     help="robotctl/assets/duck.bin for the 3D direction view")
+    ap.add_argument("--robotd-config", default="/etc/robot/robotd.toml",
+                    help="config rewritten by the policy slow-motion controls")
     args = ap.parse_args()
+
+    ensure_root()
 
     if not os.path.exists(SOCKET):
         print(f"{SOCKET} is missing — is robotd running?  systemctl status robotd")
@@ -1217,6 +1422,8 @@ def main() -> int:
 
     load_calibration(args.scs, args.limits)
     load_model(args.model)
+    SLOW["config"] = args.robotd_config
+    SLOW["divisor"] = read_policy_divisor(args.robotd_config)
     path = args.record or f"duck-run-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     record = open(path, "a", encoding="utf-8")
     feed = Feed(args.hz, args.seconds, record)
@@ -1246,4 +1453,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except PermissionError as error:
+        print(f"duck_dash: {error}", file=sys.stderr)
+        raise SystemExit(1)
